@@ -344,18 +344,31 @@ impl<'a> GitCheckout<'a> {
     }
 
     fn update_submodules(&self, cargo_config: &Config) -> CargoResult<()> {
-        return update_submodules(&self.repo, cargo_config);
+        return update_submodules(&self.repo, cargo_config, self.database.remote.url().clone());
 
-        fn update_submodules(repo: &git2::Repository, cargo_config: &Config) -> CargoResult<()> {
+        fn update_submodules(
+            repo: &git2::Repository,
+            cargo_config: &Config,
+            mut parent_url: Url,
+        ) -> CargoResult<()> {
             info!("update submodules for: {:?}", repo.workdir().unwrap());
 
+            // git relative urls always treat the last part of their base url as if it was a directory even when it was written as a file
+            let path = parent_url.path();
+            if path.chars().last().map(|c| c != '/').unwrap_or(false) {
+                let path = format!("{}/", path);
+                parent_url.set_path(&path)
+            }
+
             for mut child in repo.submodules()? {
-                update_submodule(repo, &mut child, cargo_config).with_context(|| {
-                    format!(
-                        "failed to update submodule `{}`",
-                        child.name().unwrap_or("")
-                    )
-                })?;
+                update_submodule(repo, &mut child, cargo_config, &parent_url).with_context(
+                    || {
+                        format!(
+                            "failed to update submodule `{}`",
+                            child.name().unwrap_or("")
+                        )
+                    },
+                )?;
             }
             Ok(())
         }
@@ -364,11 +377,18 @@ impl<'a> GitCheckout<'a> {
             parent: &git2::Repository,
             child: &mut git2::Submodule<'_>,
             cargo_config: &Config,
+            parent_url: &Url,
         ) -> CargoResult<()> {
             child.init(false)?;
             let url = child.url().ok_or_else(|| {
                 anyhow::format_err!("non-utf8 url for submodule {:?}?", child.path())
             })?;
+            let url = Url::options()
+                .base_url(Some(parent_url))
+                .parse(url)
+                .map_err(|_| {
+                    anyhow::format_err!("invalid url for submodule {:?} : {:?}", child.path(), url)
+                })?;
 
             // A submodule which is listed in .gitmodules but not actually
             // checked out will not have a head id, so we should ignore it.
@@ -388,7 +408,7 @@ impl<'a> GitCheckout<'a> {
             let mut repo = match head_and_repo {
                 Ok((head, repo)) => {
                     if child.head_id() == head {
-                        return update_submodules(&repo, cargo_config);
+                        return update_submodules(&repo, cargo_config, url);
                     }
                     repo
                 }
@@ -403,7 +423,7 @@ impl<'a> GitCheckout<'a> {
             cargo_config
                 .shell()
                 .status("Updating", format!("git submodule `{}`", url))?;
-            fetch(&mut repo, url, &reference, cargo_config).with_context(|| {
+            fetch(&mut repo, url.as_str(), &reference, cargo_config).with_context(|| {
                 format!(
                     "failed to fetch submodule `{}` from {}",
                     child.name().unwrap_or(""),
@@ -413,7 +433,7 @@ impl<'a> GitCheckout<'a> {
 
             let obj = repo.find_object(head, None)?;
             reset(&repo, &obj, cargo_config)?;
-            update_submodules(&repo, cargo_config)
+            update_submodules(&repo, cargo_config, url)
         }
     }
 }
